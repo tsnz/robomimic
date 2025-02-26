@@ -308,6 +308,18 @@ class Algo(object):
         """
         return
 
+    def pre_model_save(self):
+        """
+        Called before saving the model
+        """
+        return
+
+    def post_model_save(self):
+        """
+        Called after saving the model
+        """
+        return
+
     def set_eval(self):
         """
         Prepare networks for evaluation.

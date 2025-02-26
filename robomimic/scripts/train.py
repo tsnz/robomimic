@@ -319,6 +319,7 @@ def train(config, device):
                 config.algo.pred_horizon,
                 config.algo.action_horizon,
             ]
+            model.pre_model_save()
             TrainUtils.save_model(
                 model=model,
                 config=config,
@@ -328,6 +329,7 @@ def train(config, device):
                 ckpt_path=os.path.join(ckpt_dir, epoch_ckpt_name + ".pth"),
                 obs_normalization_stats=obs_normalization_stats,
             )
+            model.post_model_save()
 
         # Finally, log memory usage in MB
         process = psutil.Process(os.getpid())

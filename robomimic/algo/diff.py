@@ -152,9 +152,6 @@ class Diff(PolicyAlgo):
         for key in obs:
             obs[key] = self._apply_horizon(obs[key], self.algo_config.obs_horizon)
 
-            # obs_modality = ObsUtils.OBS_KEYS_TO_MODALITIES[key]
-            # if ObsUtils.DEFAULT_ENCODER_KWARGS[obs_modality]["core_class"] == "VisualCore":
-            #     obs[key] = obs[key].flatten(end_dim=1)
         return obs
 
     def _apply_horizon(self, vals, horizon):

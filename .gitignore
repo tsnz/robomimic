@@ -123,3 +123,12 @@ venv.bak/
 
 # private macros
 macros_private.py
+
+# Models
+*_trained_models/
+
+# Config files from paper
+robomimic/exps/
+
+# VS Code
+.vscode/

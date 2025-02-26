@@ -57,10 +57,30 @@ class BaseConfig(Config):
         self.algo_name = type(self).ALGO_NAME
 
         self.experiment_config()
-        self.train_config()
         self.algo_config()
+        self.train_config()
         self.observation_config()
         self.meta_config()
+
+        # checks for horizon settings
+        if hasattr(self.algo, "obs_horizon"):
+            assert self.algo.obs_horizon <= self.train.seq_length, (
+                "obs horizon cannot be greater than train sequence length"
+            )
+        else:
+            self.algo["obs_horizon"] = 1
+        if hasattr(self.algo, "pred_horizon"):
+            assert self.algo.pred_horizon <= self.train.seq_length, (
+                "prediction horizon cannot be greater than train sequence length"
+            )
+        else:
+            self.algo["pred_horizon"] = 1
+        if hasattr(self.algo, "action_horizon"):
+            assert self.algo.action_horizon <= self.algo.pred_horizon, (
+                "action horizon cannot be greater than number of predictions made"
+            )
+        else:
+            self.algo["action_horizon"] = 1
 
         # After Config init, new keys cannot be added to the config, except under nested
         # attributes that have called @do_not_lock_keys

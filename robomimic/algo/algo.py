@@ -296,6 +296,18 @@ class Algo(object):
             if self.lr_schedulers[k] is not None:
                 self.lr_schedulers[k].step()
 
+    def on_train_end(self):
+        """
+        Called at the end of training.
+        """
+        return
+
+    def pre_run_prep(self, train_data, val_data):
+        """
+        Called before training to adapt settings depending on train and validation data
+        """
+        return
+
     def set_eval(self):
         """
         Prepare networks for evaluation.
@@ -515,12 +527,19 @@ class RolloutPolicy(object):
         Produce action from raw observation dict (and maybe goal dict) from environment.
 
         Args:
-            ob (dict): single observation dictionary from environment (no batch dimension, 
+            ob (dict): single observation dictionary from environment (no batch dimension,
                 and np.array values for each key)
             goal (dict): goal observation
         """
-        ob = self._prepare_observation(ob)
+        nobs = list()
+        for o in ob:
+            nobs.append(self._prepare_observation(o))
         if goal is not None:
             goal = self._prepare_observation(goal)
-        ac = self.policy.get_action(obs_dict=ob, goal_dict=goal)
+
+        # if obs que == 1 then return obs directly for compatibility reasons
+        if len(ob) == 1:
+            ac = self.policy.get_action(obs_dict=nobs[0], goal_dict=goal)
+        else:
+            ac = self.policy.get_action(obs_dict=nobs, goal_dict=goal)
         return TensorUtils.to_numpy(ac[0])

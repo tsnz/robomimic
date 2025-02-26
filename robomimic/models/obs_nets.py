@@ -468,6 +468,280 @@ class ObservationGroupEncoder(Module):
         msg = header + '(' + msg + '\n)'
         return msg
 
+def multi_step_obs_encoder_factory(
+    obs_shapes, feature_activation=nn.ReLU, encoder_kwargs=None, obs_horizon=1
+):
+    """
+    Utility function to create an @ObservationEncoder from kwargs specified in config.
+
+    Args:
+        obs_shapes (OrderedDict): a dictionary that maps observation key to
+            expected shapes for observations.
+
+        feature_activation: non-linearity to apply after each obs net - defaults to ReLU. Pass
+            None to apply no activation.
+
+        encoder_kwargs (dict or None): If None, results in default encoder_kwargs being applied. Otherwise, should be
+            nested dictionary containing relevant per-modality information for encoder networks.
+            Should be of form:
+
+            obs_modality1: dict
+                feature_dimension: int
+                core_class: str
+                core_kwargs: dict
+                    ...
+                    ...
+                obs_randomizer_class: str
+                obs_randomizer_kwargs: dict
+                    ...
+                    ...
+            obs_modality2: dict
+                ...
+
+        obs_horizon (int): number of obs steps
+    """
+    enc = MultiStepObservationEncoder(
+        feature_activation=feature_activation, obs_horizon=obs_horizon
+    )
+    for k, obs_shape in obs_shapes.items():
+        obs_modality = ObsUtils.OBS_KEYS_TO_MODALITIES[k]
+        enc_kwargs = (
+            deepcopy(ObsUtils.DEFAULT_ENCODER_KWARGS[obs_modality])
+            if encoder_kwargs is None
+            else deepcopy(encoder_kwargs[obs_modality])
+        )
+
+        for obs_module, cls_mapping in zip(
+            ("core", "obs_randomizer"),
+            (ObsUtils.OBS_ENCODER_CORES, ObsUtils.OBS_RANDOMIZERS),
+        ):
+            # Sanity check for kwargs in case they don't exist / are None
+            if enc_kwargs.get(f"{obs_module}_kwargs", None) is None:
+                enc_kwargs[f"{obs_module}_kwargs"] = {}
+            # Add in input shape info
+            enc_kwargs[f"{obs_module}_kwargs"]["input_shape"] = obs_shape
+            # If group class is specified, then make sure corresponding kwargs only contain relevant kwargs
+            if enc_kwargs[f"{obs_module}_class"] is not None:
+                enc_kwargs[f"{obs_module}_kwargs"] = (
+                    extract_class_init_kwargs_from_dict(
+                        cls=cls_mapping[enc_kwargs[f"{obs_module}_class"]],
+                        dic=enc_kwargs[f"{obs_module}_kwargs"],
+                        copy=False,
+                    )
+                )
+
+        # Add in input shape info
+        randomizer = (
+            None
+            if enc_kwargs["obs_randomizer_class"] is None
+            else ObsUtils.OBS_RANDOMIZERS[enc_kwargs["obs_randomizer_class"]](
+                **enc_kwargs["obs_randomizer_kwargs"]
+            )
+        )
+
+        enc.register_obs_key(
+            name=k,
+            shape=obs_shape,
+            net_class=enc_kwargs["core_class"],
+            net_kwargs=enc_kwargs["core_kwargs"],
+            randomizer=randomizer,
+        )
+
+    enc.make()
+    return enc
+
+
+class MultiStepObservationEncoder(ObservationEncoder):
+    """
+    Module that processes inputs by observation key and then concatenates the processed
+    observation keys together. Each key is processed with an encoder head network.
+    Call @register_obs_key to register observation keys with the encoder and then
+    finally call @make to create the encoder networks.
+    """
+
+    def __init__(self, feature_activation=nn.ReLU, obs_horizon=1):
+        super(MultiStepObservationEncoder, self).__init__(feature_activation)
+        self.obs_horizon = obs_horizon
+
+    def forward(self, obs_dict):
+        """
+        Processes modalities according to the ordering in @self.obs_shapes. For each
+        modality, it is processed with a randomizer (if present), an encoder
+        network (if present), and again with the randomizer (if present), flattened,
+        and then concatenated with the other processed modalities.
+
+        Args:
+            obs_dict (OrderedDict): dictionary that maps modalities to torch.Tensor
+                batches that agree with @self.obs_shapes. All modalities in
+                @self.obs_shapes must be present, but additional modalities
+                can also be present.
+
+        Returns:
+            feats (torch.Tensor): flat features of shape [B, H x D]
+        """
+        assert self._locked, "ObservationEncoder: @make has not been called yet"
+
+        # ensure all modalities that the encoder handles are present
+        assert set(self.obs_shapes.keys()).issubset(obs_dict), (
+            "ObservationEncoder: {} does not contain all modalities {}".format(
+                list(obs_dict.keys()), list(self.obs_shapes.keys())
+            )
+        )
+
+        # process modalities by order given by @self.obs_shapes
+        feats = []
+        for k in self.obs_shapes:
+            x = obs_dict[k]
+            # maybe process encoder input with randomizer
+            if self.obs_randomizers[k] is not None:
+                x = self.obs_randomizers[k].forward_in(x)
+            # maybe process with obs net
+            if self.obs_nets[k] is not None:
+                # stack obs steps, effectively increasing batch size
+                # e.g. [256(B), 2(H), 3, 84, 84] -> [512(BxH), 3, 84, 84]
+                # this way the entire obs sequence can be passed into the net
+                x = x.flatten(end_dim=1)
+                x = self.obs_nets[k](x)
+                if self.activation is not None:
+                    x = self.activation(x)
+                # reshape back to [B, H, (Encoder Output)]
+                x = x.reshape(int(x.shape[0] / self.obs_horizon), self.obs_horizon, -1)
+            # maybe process encoder output with randomizer
+            if self.obs_randomizers[k] is not None:
+                x = self.obs_randomizers[k].forward_out(x)
+
+            # flatten to [B, H, D]
+            x = TensorUtils.flatten(x, begin_axis=2)
+            feats.append(x)
+
+        # concatenate all features for each obs step together
+        feats = torch.cat(feats, dim=-1)
+        # concatenate all obs steps
+        return feats.flatten(start_dim=1)
+
+
+class MultiStepObservationGroupEncoder(Module):
+    """
+    This class allows networks to encode multiple observation dictionaries into a single
+    flat, concatenated vector representation. It does this by assigning each observation
+    dictionary (observation group) an @ObservationEncoder object.
+
+    The class takes a dictionary of dictionaries, @observation_group_shapes.
+    Each key corresponds to a observation group (e.g. 'obs', 'subgoal', 'goal')
+    and each OrderedDict should be a map between modalities and
+    expected input shapes (e.g. { 'image' : (3, 120, 160) }).
+    """
+
+    def __init__(
+        self,
+        observation_group_shapes,
+        feature_activation=nn.ReLU,
+        encoder_kwargs=None,
+        obs_horizon=1,
+    ):
+        """
+        Args:
+            observation_group_shapes (OrderedDict): a dictionary of dictionaries.
+                Each key in this dictionary should specify an observation group, and
+                the value should be an OrderedDict that maps modalities to
+                expected shapes.
+
+            feature_activation: non-linearity to apply after each obs net - defaults to ReLU. Pass
+                None to apply no activation.
+
+            encoder_kwargs (dict or None): If None, results in default encoder_kwargs being applied. Otherwise, should
+                be nested dictionary containing relevant per-modality information for encoder networks.
+                Should be of form:
+
+                obs_modality1: dict
+                    feature_dimension: int
+                    core_class: str
+                    core_kwargs: dict
+                        ...
+                        ...
+                    obs_randomizer_class: str
+                    obs_randomizer_kwargs: dict
+                        ...
+                        ...
+                obs_modality2: dict
+                    ...
+        """
+        super(MultiStepObservationGroupEncoder, self).__init__()
+
+        # type checking
+        assert isinstance(observation_group_shapes, OrderedDict)
+        assert np.all(
+            [
+                isinstance(observation_group_shapes[k], OrderedDict)
+                for k in observation_group_shapes
+            ]
+        )
+
+        self.observation_group_shapes = observation_group_shapes
+        self.obs_horizon = obs_horizon
+
+        # create an observation encoder per observation group
+        self.nets = nn.ModuleDict()
+        for obs_group in self.observation_group_shapes:
+            self.nets[obs_group] = multi_step_obs_encoder_factory(
+                obs_shapes=self.observation_group_shapes[obs_group],
+                feature_activation=feature_activation,
+                encoder_kwargs=encoder_kwargs,
+                obs_horizon=obs_horizon,
+            )
+
+    def forward(self, **inputs):
+        """
+        Process each set of inputs in its own observation group.
+
+        Args:
+            inputs (dict): dictionary that maps observation groups to observation
+                dictionaries of torch.Tensor batches that agree with
+                @self.observation_group_shapes. All observation groups in
+                @self.observation_group_shapes must be present, but additional
+                observation groups can also be present. Note that these are specified
+                as kwargs for ease of use with networks that name each observation
+                stream in their forward calls.
+
+        Returns:
+            outputs (torch.Tensor): flat outputs of shape [B, D]
+        """
+
+        # ensure all observation groups we need are present
+        assert set(self.observation_group_shapes.keys()).issubset(inputs), (
+            "{} does not contain all observation groups {}".format(
+                list(inputs.keys()), list(self.observation_group_shapes.keys())
+            )
+        )
+
+        outputs = []
+        # Deterministic order since self.observation_group_shapes is OrderedDict
+        for obs_group in self.observation_group_shapes:
+            # pass through encoder
+            outputs.append(self.nets[obs_group].forward(inputs[obs_group]))
+
+        return torch.cat(outputs, dim=-1)
+
+    def output_shape(self):
+        """
+        Compute the output shape of this encoder.
+        """
+        feat_dim = 0
+        for obs_group in self.observation_group_shapes:
+            # get feature dimension of these keys
+            feat_dim += self.nets[obs_group].output_shape()[0]
+        return [feat_dim]
+
+    def __repr__(self):
+        """Pretty print network."""
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
+        for k in self.observation_group_shapes:
+            msg += "\n"
+            indent = " " * 4
+            msg += textwrap.indent("group={}\n{}".format(k, self.nets[k]), indent)
+        msg = header + "(" + msg + "\n)"
+        return msg
 
 class MIMO_MLP(Module):
     """

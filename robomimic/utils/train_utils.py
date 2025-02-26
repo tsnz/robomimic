@@ -3,6 +3,7 @@ This file contains several utility functions used to define the main training lo
 mainly consists of functions to assist with logging, rollouts, and the @run_epoch function,
 which is the core training logic for models in this repository.
 """
+import collections
 import os
 import time
 import datetime
@@ -177,6 +178,8 @@ def run_rollout(
         video_writer=None,
         video_skip=5,
         terminate_on_success=False,
+        obs_horizon = 1,
+        action_horizon = 1
     ):
     """
     Runs a rollout in an environment with the current network parameters.
@@ -192,12 +195,16 @@ def run_rollout(
 
         render (bool): if True, render the rollout to the screen
 
-        video_writer (imageio Writer instance): if not None, use video writer object to append frames at 
+        video_writer (imageio Writer instance): if not None, use video writer object to append frames at
             rate given by @video_skip
 
         video_skip (int): how often to write video frame
 
         terminate_on_success (bool): if True, terminate episode early as soon as a success is encountered
+
+        obs_horizon (int): number of observations to pass to the net
+
+        action_horizon (int): number of actuions to execute
 
     Returns:
         results (dict): dictionary containing return, success rate, etc.
@@ -208,6 +215,9 @@ def run_rollout(
     policy.start_episode()
 
     ob_dict = env.reset()
+
+    obs_deque = collections.deque([ob_dict] * obs_horizon, maxlen=obs_horizon)
+    
     goal_dict = None
     if use_goals:
         # retrieve goal from the environment
@@ -223,33 +233,46 @@ def run_rollout(
         for step_i in range(horizon):
 
             # get action from policy
-            ac = policy(ob=ob_dict, goal=goal_dict)
+            ac = policy(ob=obs_deque, goal=goal_dict)
 
-            # play action
-            ob_dict, r, done, _ = env.step(ac)
+            # unsqueeze if number of actions is 1
+            if ac.ndim == 1:
+                ac = np.expand_dims(ac, 0)
+            start = obs_horizon - 1
+            end = start + action_horizon
+            action = ac[start:end, :]
 
-            # render to screen
-            if render:
-                env.render(mode="human")
+            for i in range(len(action)):
+                # play action
+                ob_dict, r, done, _ = env.step(action[i])
+                obs_deque.append(ob_dict)
 
-            # compute reward
-            total_reward += r
+                # render to screen
+                if render:
+                    env.render(mode="human")
 
-            cur_success_metrics = env.is_success()
-            for k in success:
-                success[k] = success[k] or cur_success_metrics[k]
+                # compute reward
+                total_reward += r
 
-            # visualization
-            if video_writer is not None:
-                if video_count % video_skip == 0:
-                    video_img = env.render(mode="rgb_array", height=512, width=512)
-                    video_writer.append_data(video_img)
+                cur_success_metrics = env.is_success()
+                for k in success:
+                    success[k] = success[k] or cur_success_metrics[k]
 
-                video_count += 1
+                # visualization
+                if video_writer is not None:
+                    if video_count % video_skip == 0:
+                        video_img = env.render(mode="rgb_array", height=512, width=512)
+                        video_writer.append_data(video_img)
 
-            # break if done
-            if done or (terminate_on_success and success["task"]):
-                break
+                    video_count += 1
+
+                # break if done
+                if done or (terminate_on_success and success["task"]):
+                    break
+            else:  # Continue if the inner loop wasn't broken
+                continue
+            # break if inner loop breaks (aka done)
+            break
 
     except env.rollout_exceptions as e:
         print("WARNING: got rollout exception {}".format(e))
@@ -279,6 +302,8 @@ def rollout_with_stats(
         video_skip=5,
         terminate_on_success=False,
         verbose=False,
+        obs_horizon = 1,
+        action_horizon = 1
     ):
     """
     A helper function used in the train loop to conduct evaluation rollouts per environment
@@ -312,6 +337,10 @@ def rollout_with_stats(
         terminate_on_success (bool): if True, terminate episode early as soon as a success is encountered
 
         verbose (bool): if True, print results of each rollout
+
+        obs_horizon (int): number of observations to pass to the net
+
+        action_horizon (int): number of actuions to execute
     
     Returns:
         all_rollout_logs (dict): dictionary of rollout statistics (e.g. return, success rate, ...) 
@@ -365,6 +394,8 @@ def rollout_with_stats(
                 video_writer=env_video_writer,
                 video_skip=video_skip,
                 terminate_on_success=terminate_on_success,
+                obs_horizon=obs_horizon,
+                action_horizon=action_horizon,
             )
             rollout_info["time"] = time.time() - rollout_timestamp
             rollout_logs.append(rollout_info)
@@ -460,7 +491,7 @@ def should_save_from_rollout_logs(
     )
 
 
-def save_model(model, config, env_meta, shape_meta, ckpt_path, obs_normalization_stats=None):
+def save_model(model, config, env_meta, shape_meta, ckpt_path, model_horizons, obs_normalization_stats=None):
     """
     Save model to a torch pth file.
 
@@ -475,6 +506,8 @@ def save_model(model, config, env_meta, shape_meta, ckpt_path, obs_normalization
 
         ckpt_path (str): writes model checkpoint to this path
 
+        model_horizons (list[int, int, int]): model horizon settings (obs, pred, action)
+
         obs_normalization_stats (dict): optionally pass a dictionary for observation
             normalization. This should map observation keys to dicts
             with a "mean" and "std" of shape (1, ...) where ... is the default
@@ -487,6 +520,7 @@ def save_model(model, config, env_meta, shape_meta, ckpt_path, obs_normalization
         config=config.dump(),
         algo_name=config.algo_name,
         env_metadata=env_meta,
+        model_horizons = model_horizons,
         shape_metadata=shape_meta,
     )
     if obs_normalization_stats is not None:

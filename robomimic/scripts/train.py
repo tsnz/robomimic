@@ -192,6 +192,8 @@ def train(config, device):
     train_num_steps = config.experiment.epoch_every_n_steps
     valid_num_steps = config.experiment.validation_epoch_every_n_steps
 
+    model.pre_run_prep(train_loader, valid_loader)
+
     for epoch in range(1, config.train.num_epochs + 1): # epoch numbers start at 1
         step_log = TrainUtils.run_epoch(
             model=model,
@@ -271,6 +273,8 @@ def train(config, device):
                 epoch=epoch,
                 video_skip=config.experiment.get("video_skip", 5),
                 terminate_on_success=config.experiment.rollout.terminate_on_success,
+                obs_horizon=config.algo.obs_horizon,
+                action_horizon=config.algo.action_horizon,
             )
 
             # summarize results from rollouts to tensorboard and terminal
@@ -310,10 +314,16 @@ def train(config, device):
 
         # Save model checkpoints based on conditions (success rate, validation loss, etc)
         if should_save_ckpt:
+            model_horizons = [
+                config.algo.obs_horizon,
+                config.algo.pred_horizon,
+                config.algo.action_horizon,
+            ]
             TrainUtils.save_model(
                 model=model,
                 config=config,
                 env_meta=env_meta,
+                model_horizons=model_horizons,
                 shape_meta=shape_meta,
                 ckpt_path=os.path.join(ckpt_dir, epoch_ckpt_name + ".pth"),
                 obs_normalization_stats=obs_normalization_stats,
@@ -325,6 +335,7 @@ def train(config, device):
         data_logger.record("System/RAM Usage (MB)", mem_usage, epoch)
         print("\nEpoch {} Memory Usage: {} MB\n".format(epoch, mem_usage))
 
+    model.on_train_end()
     # terminate logging
     data_logger.close()
 
